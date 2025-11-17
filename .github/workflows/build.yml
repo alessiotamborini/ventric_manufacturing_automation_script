@@ -28,7 +28,7 @@ jobs:
         pyinstaller --onefile --windowed --name "JSON_Analysis_Tool" analyze_json_file_batch.py
         
     - name: Upload Windows executable
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: JSON_Analysis_Tool_Windows
         path: dist/JSON_Analysis_Tool.exe
