@@ -377,11 +377,35 @@ def save_results(results_df, results_folder):
     settled_value_cols = ['Max Settled Value', 'Min Settled Value', 'Mean Settled Value', 'Std Settled Value']
     display_df[settled_value_cols] = display_df[settled_value_cols].round(0)
     
-    # Save styled Excel version with red highlighting for failed tests
+    # Apply styling to highlight failed rows
     styled_df = display_df.style.apply(highlight_failed_rows, axis=1)
     styled_df = styled_df.set_properties(**{'text-align': 'center'})
+
+    # create another sheet that only contains failed files
+    failed_df = display_df[display_df['Final Pass/Fail'] == False]
+    failed_styled_df = failed_df.style.apply(highlight_failed_rows, axis=1)
+    failed_styled_df = failed_styled_df.set_properties(**{'text-align': 'center'})
+
+    # Save to excel file
     excel_file = os.path.join(results_folder, "analysis_results.xlsx")
-    styled_df.to_excel(excel_file, index=False, engine='openpyxl')
+    from openpyxl import load_workbook
+    with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+        # first save the styled dataframe to the first sheet
+        styled_df.to_excel(writer, sheet_name='All Results', index=False)
+
+        # then save the failed dataframe to the second sheet
+        failed_styled_df.to_excel(writer, sheet_name='Failed Files', index=False)
+
+    # format the excel sheet to have the columns auto-sized
+    wb = load_workbook(excel_file)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for column_cells in ws.columns:
+            length = max(len(str(cell.value)) for cell in column_cells)
+            ws.column_dimensions[column_cells[0].column_letter].width = length + 2
+    wb.save(excel_file)
+
+    # styled_df.to_excel(excel_file, index=False, engine='openpyxl')
     print(f"Styled results saved to Excel: {excel_file}")
 
 def print_summary_statistics(results_df):
@@ -422,8 +446,8 @@ def main():
     print(f"Results will be saved to: {results_folder}")
     print(f"Visualizations will be saved to: {visualizations_folder}")
     
-    # Step 4: Create sample visualizations for all files
-    create_sample_visualizations(data, data_files, visualizations_folder)
+    # # Step 4: Create sample visualizations for all files
+    # create_sample_visualizations(data, data_files, visualizations_folder)
     
     # Step 5: Analyze all files
     print("\nAnalyzing all files...")
