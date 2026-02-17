@@ -13,7 +13,9 @@ matplotlib.use("Agg")
 plt.ioff()
 import matplotlib.style as mplstyle
 mplstyle.use('fast')
-
+from openpyxl import load_workbook
+import traceback
+from datetime import datetime
 
 # ============================================================================
 # DATA LOADING AND FOLDER UTILITIES
@@ -65,7 +67,7 @@ def _select_data_folder():
     return folder_path
 
 
-def _load_json_files(data_folder):
+def _load_json_files(data_folder, save_folder=None):
     """Load all JSON files from the selected folder."""
     if not data_folder:
         print("No folder selected. Exiting.")
@@ -82,12 +84,33 @@ def _load_json_files(data_folder):
     
     # Load all JSON files
     data = {}
+    failed_files = []
     for file in tqdm(data_files, total=len(data_files), desc="Loading JSON files"):
         try:
             with open(os.path.join(data_folder, file), 'r') as f:
                 data[file] = json.load(f)
         except Exception as e:
             print(f"Error loading {file}: {e}")
+            failed_files.append((file, str(e)))
+    
+    # summarize results
+    total_files = len(data_files)
+    loaded_count = len(data)
+    failed_count = len(failed_files)
+
+    # write a load log the user can inspect 
+    log_path = os.path.join(save_folder, "load_log.txt") if save_folder else None
+    if log_path:
+        with open(log_path, 'w') as log_file:
+            log_file.write(f"JSON load run: {datetime.now().isoformat()}\n")
+            log_file.write(f"Data folder: {data_folder}\n")
+            log_file.write(f"Total JSON files found: {total_files}\n")
+            log_file.write(f"Successfully loaded: {loaded_count}\n")
+            log_file.write(f"Failed to load: {failed_count}\n\n")
+            if failed_files:
+                log_file.write("Failed files and errors:\n")
+                for file, error in failed_files:
+                    log_file.write(f"{file}: {error}\n")
     
     return data, data_files
 
@@ -388,7 +411,6 @@ def save_results(results_df, results_folder):
 
     # Save to excel file
     excel_file = os.path.join(results_folder, "analysis_results.xlsx")
-    from openpyxl import load_workbook
     with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
         # first save the styled dataframe to the first sheet
         styled_df.to_excel(writer, sheet_name='All Results', index=False)
@@ -433,18 +455,17 @@ def main():
     if not data_folder:
         print("No folder selected. Exiting.")
         return
-    
     print(f"Selected folder: {data_folder}")
     
-    # Step 2: Load JSON files
-    data, data_files = _load_json_files(data_folder)
-    if data is None:
-        return
-    
-    # Step 3: Create results and visualizations folders
+    # Step 2: Create results and visualizations folders
     results_folder, visualizations_folder = _create_results_folder(data_folder)
     print(f"Results will be saved to: {results_folder}")
     print(f"Visualizations will be saved to: {visualizations_folder}")
+
+    # Step 3: Load JSON files
+    data, data_files = _load_json_files(data_folder, results_folder)
+    if data is None:
+        return
     
     # # Step 4: Create sample visualizations for all files
     # create_sample_visualizations(data, data_files, visualizations_folder)
