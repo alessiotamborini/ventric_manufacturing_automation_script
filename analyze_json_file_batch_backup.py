@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import re
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import numpy as np
@@ -18,38 +17,6 @@ mplstyle.use('fast')
 # ============================================================================
 # DATA LOADING AND FOLDER UTILITIES
 # ============================================================================
-
-def parse_device_name(dev_name, cuff_prefix='CAA', ekg_prefix='PAA'):
-    """
-    Parse device name into cuff_id and ekg_id components.
-    
-    Args:
-        dev_name: Device name string (e.g., 'CAA041PAA046')
-        cuff_prefix: Prefix for cuff ID (default: 'CAA')
-        ekg_prefix: Prefix for EKG ID (default: 'PAA')
-    
-    Returns:
-        tuple: (cuff_id, ekg_id) or (None, None) if parsing fails
-        
-    Examples:
-        >>> parse_device_name('CAA041PAA046')
-        ('CAA041', 'PAA046')
-        >>> parse_device_name('CAA1PAA2')
-        ('CAA1', 'PAA2')
-        >>> parse_device_name('CAA1234PAA56789')
-        ('CAA1234', 'PAA56789')
-    """
-    # Create regex pattern: prefix followed by one or more digits
-    pattern = f'^({cuff_prefix}\\d+)({ekg_prefix}\\d+)$'
-    
-    match = re.match(pattern, dev_name)
-    if match:
-        cuff_id = match.group(1)
-        ekg_id = match.group(2)
-        return cuff_id, ekg_id
-    else:
-        return None, None
-
 
 def _select_data_folder():
     """Open a dialog to select the folder containing JSON files."""
@@ -94,8 +61,7 @@ def _load_json_files(data_folder):
 
 def _create_results_folder(data_folder):
     """Create a results folder and visualizations subfolder within the data folder."""
-    base_folder = os.path.dirname(data_folder.rstrip('/\\'))
-    results_folder = os.path.join(base_folder, "analysis_results")
+    results_folder = os.path.join(data_folder, "analysis_results")
     visualizations_folder = os.path.join(results_folder, "visualizations")
     os.makedirs(results_folder, exist_ok=True)
     os.makedirs(visualizations_folder, exist_ok=True)
@@ -148,41 +114,19 @@ def _analyze_single_file(sample_data):
     else:
         settled_signal = ssbp_hold_data
 
-    # compute the mean, max, min, and std of the settled signal
-    mean_settled = np.mean(settled_signal)
-    max_settled = np.max(settled_signal)
-    min_settled = np.min(settled_signal)
-    std_settled = np.std(settled_signal)
-
-    # condition 1 - mean of settled signal < 11000 & > 6500
-    cond1_st = mean_settled < 11000
-    cond1_lt = mean_settled > 6500
-    cond1 = cond1_st and cond1_lt
-
-    # condition 2 - Max of settled signal < 14000
-    cond2 = max_settled < 14000
-
-    # condition 3 - Min of settled signal > 2000
-    cond3 = min_settled > 2000
-
-    # condition 4 - Std of settled signal < 1000
-    cond4 = std_settled < 1000
-
-    # Final condition
-    cond = cond1 and cond2 and cond3 and cond4
+    # Determine if the signals drop to within the boundaries
+    thres_7000 = np.any(settled_signal < 7000)
+    thres_9000 = np.any(settled_signal < 9000)
+    cond = thres_7000 and thres_9000
 
     return {
-        'max_settled_value': max_settled,
-        'min_settled_value': min_settled,
-        'mean_settled_value': mean_settled,
-        'std_settled_value': std_settled,
-        'cond1': cond1,
-        'cond1_st': cond1_st,
-        'cond1_lt': cond1_lt,
-        'cond2': cond2,
-        'cond3': cond3,
-        'cond4': cond4,
-        'cond_final': cond,
+        'max_value': max_value,
+        'min_settled_value': np.min(settled_signal),
+        'mean_settled_value': np.mean(settled_signal),
+        'std_settled_value': np.std(settled_signal),
+        'thres_7000': thres_7000,
+        'thres_9000': thres_9000,
+        'cond': cond
     }
 
 
@@ -192,17 +136,9 @@ def analyze_all_files(data, data_files):
     
     for file_name, sample_data in tqdm(data.items(), total=len(data), desc="Analyzing files"):
         try:
-            # partition the name to extract relevant info
-            file_name = file_name.strip('.json')
-            dev_names, run_name = file_name.split('-')
-            cuff_id, ekg_id = parse_device_name(dev_names)
-
             metrics = _analyze_single_file(sample_data)
             result = {
                 'file_name': file_name,
-                'cuff_id': cuff_id,
-                'ekg_id': ekg_id,
-                'run_name': run_name,
                 **metrics
             }
             results.append(result)
@@ -211,10 +147,13 @@ def analyze_all_files(data, data_files):
             print(f"Error processing {file_name}: {e}")
             result = {
                 'file_name': file_name,
-                'cuff_id': None,
-                'ekg_id': None,
-                'run_name': None,
-                'cond_final': False,
+                'thres_7000': False,
+                'thres_9000': False,
+                'cond': False,
+                'max_value': np.nan,
+                'min_settled_value': np.nan,
+                'mean_settled_value': np.nan,
+                'std_settled_value': np.nan,
                 'error': str(e)
             }
             results.append(result)
@@ -244,7 +183,9 @@ def _plot_sample_visualization(sample_data, file_name, visualizations_folder):
     
     # Plot sSBP hold signal
     ax[1].plot(ssbp_hold_data, label='Signal')
-    ax[1].axhline(np.mean(ssbp_hold_data[-10000:]), color='k', linestyle='-', label='Mean of Settled Signal')
+    ax[1].axhline(np.mean(ssbp_hold_data[-10000:]), color='b', linestyle='-', label='Mean of Settled Signal')
+    ax[1].axhline(y=7000, color='r', linestyle='--', label='7000 line')
+    ax[1].axhline(y=9000, color='g', linestyle='--', label='9000 line')
     ax[1].grid(axis='y')
     ax[1].set_title('sSBP Hold Signal')
     ax[1].set_xlabel('Time (n)')
@@ -256,8 +197,9 @@ def _plot_sample_visualization(sample_data, file_name, visualizations_folder):
     # Save the plot
     plot_filename = f"{os.path.splitext(file_name)[0]}.png"
     plot_path = os.path.join(visualizations_folder, plot_filename)
-    plt.savefig(plot_path)
+    plt.savefig(plot_path, bbox_inches='tight')
     plt.close(fig)
+
 
 def create_sample_visualizations(data, data_files, visualizations_folder):
     """Create sample visualizations for all JSON files."""
@@ -276,123 +218,77 @@ def create_sample_visualizations(data, data_files, visualizations_folder):
     
     print("Sample visualizations completed!")
 
+
 def create_summary_dashboard(results_df, visualizations_folder):
     """Create and save a summary dashboard with analysis statistics."""
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
     # Threshold compliance
-    axes[0, 0].bar(['Cond1', 'Cond2', 'Cond3', 'Cond4', 'Final Cond'], 
-                   [results_df['cond1'].sum(), results_df['cond2'].sum(), results_df['cond3'].sum(), results_df['cond4'].sum(), results_df['cond_final'].sum()])
+    axes[0, 0].bar(['7000 Threshold', '9000 Threshold', 'Both Conditions'], 
+                   [results_df['thres_7000'].sum(), results_df['thres_9000'].sum(), results_df['cond'].sum()])
     axes[0, 0].set_title('Threshold Compliance')
     axes[0, 0].set_ylabel('Number of Files')
-
-    # for each column, add text at the base of the bar
-    for i, v in enumerate([results_df['cond1'].sum(), results_df['cond2'].sum(), results_df['cond3'].sum(), results_df['cond4'].sum(), results_df['cond_final'].sum()]):
-        axes[0, 0].text(i, 20, str(v), color='black', ha='center', va='bottom', bbox=dict(facecolor='white', alpha=0.5, edgecolor='black'))
     
     # Max values distribution
-    axes[0, 1].hist(results_df['max_settled_value'].dropna(), bins=20, alpha=0.7)
+    axes[0, 1].hist(results_df['max_value'].dropna(), bins=20, alpha=0.7)
     axes[0, 1].set_title('Distribution of Max Values')
     axes[0, 1].set_xlabel('Max Value')
     axes[0, 1].set_ylabel('Frequency')
-    axes[0, 1].axvline(x=14000, color='r', linestyle='--', label='14000 threshold')
-    axes[0, 1].legend()
-    text = (f'Total Files: {len(results_df)}\n'
-            f'Num >14000: {(results_df["max_settled_value"] > 14000).sum()}')
-    axes[0, 1].text(0.95, 0.95, text, transform=axes[0, 1].transAxes,
-                    verticalalignment='top', horizontalalignment='right')
-
+    
     # Min settled values distribution
     axes[1, 0].hist(results_df['min_settled_value'].dropna(), bins=20, alpha=0.7)
     axes[1, 0].set_title('Distribution of Min Settled Values')
     axes[1, 0].set_xlabel('Min Settled Value')
     axes[1, 0].set_ylabel('Frequency')
-    axes[1, 0].axvline(x=2000, color='r', linestyle='--', label='2000 threshold')
+    axes[1, 0].axvline(x=7000, color='r', linestyle='--', label='7000 threshold')
+    axes[1, 0].axvline(x=9000, color='g', linestyle='--', label='9000 threshold')
     axes[1, 0].legend()
-    text = (f'Total Files: {len(results_df)}\n'
-            f'Num <2000: {(results_df["min_settled_value"] < 2000).sum()}')
-    axes[1, 0].text(0.95, 0.95, text, transform=axes[1, 0].transAxes,
-                    verticalalignment='top', horizontalalignment='right')
     
     # Mean settled values distribution
     axes[1, 1].hist(results_df['mean_settled_value'].dropna(), bins=20, alpha=0.7)
     axes[1, 1].set_title('Distribution of Mean Settled Values')
     axes[1, 1].set_xlabel('Mean Settled Value')
     axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].axvline(x=6500, color='r', linestyle='--', label='6500 threshold')
-    axes[1, 1].axvline(x=11000, color='g', linestyle='--', label='11000 threshold')
+    axes[1, 1].axvline(x=7000, color='r', linestyle='--', label='7000 threshold')
+    axes[1, 1].axvline(x=9000, color='g', linestyle='--', label='9000 threshold')
     axes[1, 1].legend()
-
-    # Add statistics text
-    text = (f'Total Files: {len(results_df)}\n'
-            f'Num <6500: {(results_df["mean_settled_value"] < 6500).sum()}\n'
-            f'Num >11000: {(results_df["mean_settled_value"] > 11000).sum()}')
-    axes[1, 1].text(0.95, 0.95, text, transform=axes[1, 1].transAxes,
-                    verticalalignment='top', horizontalalignment='right')
+    text = f'Total Files: {len(results_df)}\nMean: {results_df["mean_settled_value"].mean():.2f}\nStd: {results_df["mean_settled_value"].std():.2f}\nMedian: {results_df["mean_settled_value"].median():.2f}\nMax: {results_df["mean_settled_value"].max():.2f}\nMin: {results_df["mean_settled_value"].min():.2f}'
+    axes[1, 1].text(0.95, 0.95, text, transform=axes[1, 1].transAxes,verticalalignment='top', horizontalalignment='right')
     
     plt.tight_layout()
     
     # Save summary dashboard
     summary_plot_path = os.path.join(visualizations_folder, "summary_dashboard.png")
     plt.savefig(summary_plot_path, bbox_inches='tight')
-    plt.close(fig)
-    
+    plt.close(fig)  # Close the figure to free memory
     print(f"Summary dashboard saved to: {summary_plot_path}")
+    
+    print(f"\nAnalysis complete!")
+    print(f"Results saved to: {results_folder}")
+    print(f"Visualizations saved to: {visualizations_folder}")
 
+
+if __name__ == "__main__":
+    main()
 
 # ============================================================================
 # RESULTS HANDLING
 # ============================================================================
 
 def save_results(results_df, results_folder):
-    """Save results to CSV and Excel files with styling in Excel."""
+    """Save results to CSV file."""
+    csv_file = os.path.join(results_folder, "analysis_results.csv")
+    results_df.to_csv(csv_file, index=False)
+    print(f"Results saved to CSV: {csv_file}")
 
-    def highlight_failed_rows(row):
-        """Highlight entire row red if condition is False."""
-        if row['Final Pass/Fail'] == False:
-            return ['background-color: #ffcccc'] * len(row)
-        else:
-            return [''] * len(row)
-
-    # Create a copy with renamed columns for better readability
-    column_rename_map = {
-        'file_name': 'File Name',
-        'cuff_id': 'Cuff ID',
-        'ekg_id': 'EKG ID',
-        'cond1': 'Condition 1 (Mean < 11000 & > 6500)',
-        'cond2': 'Condition 2 (Max < 14000)',
-        'cond3': 'Condition 3 (Min > 2000)',
-        'cond4': 'Condition 4 (Std < 1000)',
-        'cond_final': 'Final Pass/Fail',
-        'max_settled_value': 'Max Settled Value',
-        'min_settled_value': 'Min Settled Value',
-        'mean_settled_value': 'Mean Settled Value',
-        'std_settled_value': 'Std Settled Value'
-    }
-    
-    # Rename columns for display
-    display_df = results_df.rename(columns=column_rename_map)
-
-    # round to 0 decimal places columns related to settled values
-    settled_value_cols = ['Max Settled Value', 'Min Settled Value', 'Mean Settled Value', 'Std Settled Value']
-    display_df[settled_value_cols] = display_df[settled_value_cols].round(0)
-    
-    # Save styled Excel version with red highlighting for failed tests
-    styled_df = display_df.style.apply(highlight_failed_rows, axis=1)
-    styled_df = styled_df.set_properties(**{'text-align': 'center'})
-    excel_file = os.path.join(results_folder, "analysis_results.xlsx")
-    styled_df.to_excel(excel_file, index=False, engine='openpyxl')
-    print(f"Styled results saved to Excel: {excel_file}")
 
 def print_summary_statistics(results_df):
     """Print summary statistics from the analysis."""
     print(f"\nSummary Statistics:")
     print(f"Total files analyzed: {len(results_df)}")
-    print(f"Files meeting condition 1: {results_df['cond1'].sum()}")
-    print(f"Files meeting condition 2: {results_df['cond2'].sum()}")
-    print(f"Files meeting condition 3: {results_df['cond3'].sum()}")
-    print(f"Files meeting condition 4: {results_df['cond4'].sum()}")
-    print(f"Files meeting both conditions: {results_df['cond_final'].sum()}")
+    print(f"Files meeting 7000 threshold: {results_df['thres_7000'].sum()}")
+    print(f"Files meeting 9000 threshold: {results_df['thres_9000'].sum()}")
+    print(f"Files meeting both conditions: {results_df['cond'].sum()}")
 
 
 # ============================================================================
@@ -446,7 +342,3 @@ def main():
     print(f"\nAnalysis complete!")
     print(f"Results saved to: {results_folder}")
     print(f"Visualizations saved to: {visualizations_folder}")
-
-
-if __name__ == "__main__":
-    main()
