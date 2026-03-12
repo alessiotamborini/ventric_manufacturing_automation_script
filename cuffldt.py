@@ -13,13 +13,12 @@ import numpy as np
 import pandas as pd
 import json
 import re
-from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from matplotlib import pyplot as plt
+import matplotlib.style as mplstyle
 from openpyxl import load_workbook
 import subprocess
 
-import pyvista as pv
-import pyvistaqt as pvqt
 from datetime import datetime
 from PyQt5.QtWidgets import QPlainTextEdit
 from PyQt5.QtGui import QFont
@@ -28,10 +27,62 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel, QLineEdit,
-    QProgressBar
+    QProgressBar, QCheckBox
 )
 
 DEFAULT_GEOMETRY_PATH = '.'
+
+# ============================================================================
+# MODULE-LEVEL PLOT WORKERS  (must be at module level to be picklable)
+# ============================================================================
+
+def _init_plot_worker():
+    """Called once in each worker process: switch to fast non-interactive backend."""
+    plt.switch_backend('agg')
+    mplstyle.use('fast')
+
+
+def _plot_worker(args):
+    """Render and save one signal visualization. Runs in a worker process."""
+    sample_data, file_name, output_folder = args
+    try:
+        # Extract cuff data
+        cuff_values = np.array(sample_data['tester_info']['cuff_data']['cuff_values'])
+        time_values = np.array(sample_data['tester_info']['cuff_data']['time'])
+
+        # Isolate sSBP hold segment
+        ssbp_hold = sample_data['hold_ssbp_cuff']
+        length = len(ssbp_hold)
+        ssbp_hold_data = cuff_values[-length:]
+        gap = len(ssbp_hold_data) - np.argmax(np.abs(np.diff(ssbp_hold_data)))
+        ssbp_hold_data = cuff_values[-(length + gap):-gap]
+
+        fig, ax = plt.subplots(1, 2, figsize=(14, 5),
+                               gridspec_kw={'width_ratios': [2, 1]}, sharey=True)
+
+        ax[0].plot(time_values, cuff_values)
+        ax[0].grid(axis='y')
+        ax[0].set_title(f'Full Cuff Signal - {file_name}')
+        ax[0].set_xlabel('Time (n)')
+        ax[0].set_ylabel('Signal Amplitude')
+
+        ax[1].plot(ssbp_hold_data, label='Signal')
+        ax[1].axhline(np.mean(ssbp_hold_data[-10000:]), color='k',
+                      linestyle='-', label='Mean of Settled Signal')
+        ax[1].grid(axis='y')
+        ax[1].set_title('sSBP Hold Signal')
+        ax[1].set_xlabel('Time (n)')
+        ax[1].legend()
+        ax[1].set_yticks(np.arange(0, 17000, 2000))
+
+        plt.tight_layout()
+        plot_path = os.path.join(output_folder, f"{os.path.splitext(file_name)[0]}.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close(fig)
+        return True
+    except Exception:
+        return False
+
 
 class AnalysisWorker(QObject):
     progress = pyqtSignal(str)
@@ -39,9 +90,10 @@ class AnalysisWorker(QObject):
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, controller):
+    def __init__(self, controller, generate_plots=True):
         super().__init__()
         self.controller = controller  # reference to CuffLDT but worker must not touch widgets
+        self.generate_plots = generate_plots
 
     def run(self):
         try:
@@ -81,15 +133,18 @@ class AnalysisWorker(QObject):
             self.progress.emit("      > Results saved to analysis_results.xlsx")
 
             # ── Step 4: visualizations ────────────────────────────────────────
-            self.progress.emit("[4/4] Creating signal visualizations...")
+            if self.generate_plots:
+                self.progress.emit("[4/4] Creating signal visualizations (parallel)...")
 
-            def viz_cb(current, total):
-                self.progress_update.emit("Creating visualizations", current, total)
+                def viz_cb(current, total):
+                    self.progress_update.emit("Creating visualizations", current, total)
 
-            self.controller._create_sample_visualizations(
-                data, files, self.controller.visualizations_folder, progress_callback=viz_cb
-            )
-            self.progress.emit(f"      > {len(files)} plots saved")
+                self.controller._create_sample_visualizations(
+                    data, files, self.controller.visualizations_folder, progress_callback=viz_cb
+                )
+                self.progress.emit(f"      > {len(files)} plots saved")
+            else:
+                self.progress.emit("[4/4] Signal visualizations skipped.")
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -104,6 +159,9 @@ class CuffLDT(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("Cuff Leakage Detection Tool")
         self.setGeometry(100, 100, 600, 260)
+        self.data_path = None
+        self.results_folder = None
+        self.visualizations_folder = None
         self._init_ui()
 
     def _init_ui(self):
@@ -133,10 +191,10 @@ class CuffLDT(QMainWindow):
         self.status_label = ReadOnlyLog()
         self.status_label.setPlainText(
             "=" * 50 + "\n"
-            "  Cuff Leakage Detection Tool\n"
-            "=" * 50 + "\n"
-            "  Select a folder containing cuff run JSON\n"
-            "  files, then press Run Analysis.\n"
+            + "  Cuff Leakage Detection Tool\n"
+            + "=" * 50 + "\n"
+            + "  Select a folder containing cuff run JSON\n"
+            + "  files, then press Run Analysis.\n"
         )
         self.status_label.setFont(QFont("Courier", 10))
         self.status_label.setFixedHeight(120)
@@ -160,12 +218,15 @@ class CuffLDT(QMainWindow):
         self.select_folder_button = QPushButton("Select Folder")
         self.run_analysis_button = QPushButton("Run Analysis")
         self.open_results_button = QPushButton("Open Results")
+        self.generate_plots_checkbox = QCheckBox("Generate plots")
+        self.generate_plots_checkbox.setChecked(True)
         self.select_folder_button.clicked.connect(self.select_folder)
         self.run_analysis_button.clicked.connect(self.run_analysis)
         self.open_results_button.clicked.connect(self.open_results)
         view_buttons.addWidget(self.select_folder_button)
         view_buttons.addWidget(self.run_analysis_button)
         view_buttons.addWidget(self.open_results_button)
+        view_buttons.addWidget(self.generate_plots_checkbox)
         self.select_folder_button.setEnabled(True)
         self.run_analysis_button.setEnabled(False)
         self.open_results_button.setEnabled(False)
@@ -217,8 +278,10 @@ class CuffLDT(QMainWindow):
         
     def run_analysis(self):
         """Initiates the analysis process for the selected folder containing cuff runs."""
-        # disable UI controls
+        # disable UI controls during analysis
         self.run_analysis_button.setEnabled(False)
+        self.select_folder_button.setEnabled(False)
+        self.generate_plots_checkbox.setEnabled(False)
         self.status_label.appendText(
             "\n" + "=" * 50 + "\n"
             "  Starting analysis...\n"
@@ -226,7 +289,7 @@ class CuffLDT(QMainWindow):
         )
 
         self._thread = QThread()
-        self._worker = AnalysisWorker(self)
+        self._worker = AnalysisWorker(self, generate_plots=self.generate_plots_checkbox.isChecked())
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
@@ -279,7 +342,6 @@ class CuffLDT(QMainWindow):
         data_files = sorted([file for file in os.listdir(self.data_path) if file.endswith(".json")])
 
         if not data_files:
-            QMessageBox.critical(self, "Error", "No JSON files found in the selected folder.")
             return None, None
 
         # Load all JSON files
@@ -317,58 +379,24 @@ class CuffLDT(QMainWindow):
         
         return data, data_files
 
-    def _plot_sample_visualization(self, sample_data, file_name, visualizations_folder):
-        """Create visualization for a sample file and save to visualizations folder."""
-        # Extract and process data
-        cuff_values, time_values = self._extract_cuff_data(sample_data)
-        ssbp_hold_data = self._process_ssbp_hold_signal(sample_data, cuff_values)
-
-        # Generate visualization
-        fig, ax = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={'width_ratios': [2, 1]}, sharey=True)
-        
-        # Plot full signal
-        ax[0].plot(time_values, cuff_values)
-        ax[0].grid(axis='y')
-        ax[0].set_title(f'Full Cuff Signal - {file_name}')
-        ax[0].set_xlabel('Time (n)')
-        ax[0].set_ylabel('Signal Amplitude')
-        
-        # Plot sSBP hold signal
-        ax[1].plot(ssbp_hold_data, label='Signal')
-        ax[1].axhline(np.mean(ssbp_hold_data[-10000:]), color='k', linestyle='-', label='Mean of Settled Signal')
-        ax[1].grid(axis='y')
-        ax[1].set_title('sSBP Hold Signal')
-        ax[1].set_xlabel('Time (n)')
-        ax[1].legend()
-        ax[1].set_yticks(np.arange(0, 17000, 2000))
-        
-        plt.tight_layout()
-        
-        # Save the plot
-        plot_filename = f"{os.path.splitext(file_name)[0]}.png"
-        plot_path = os.path.join(visualizations_folder, plot_filename)
-        plt.savefig(plot_path)
-        plt.close(fig)
-
     def _create_sample_visualizations(self, data, data_files, visualizations_folder, progress_callback=None):
-        """Create sample visualizations for all JSON files."""
-        print(f"\nCreating sample visualizations for all {len(data_files)} files...")
-
-        # Create the sample visualizations save folder
+        """Create signal visualizations for all JSON files using parallel worker processes."""
         sample_visualizations_folder = os.path.join(visualizations_folder, "signal_visualizations")
         os.makedirs(sample_visualizations_folder, exist_ok=True)
 
-        total = len(data_files)
-        for i, file_name in enumerate(data_files):
-            if progress_callback:
-                progress_callback(i + 1, total)
-            try:
-                sample_data = data[file_name]
-                self._plot_sample_visualization(sample_data, file_name, sample_visualizations_folder)
-            except Exception as e:
-                print(f"Error creating visualization for {file_name}: {e}")
-        
-        print("Sample visualizations completed!")
+        args_list = [(data[f], f, sample_visualizations_folder) for f in data_files if f in data]
+        total = len(args_list)
+
+        with ProcessPoolExecutor(max_workers=os.cpu_count(),
+                                 initializer=_init_plot_worker) as pool:
+            futures = {pool.submit(_plot_worker, args): args[1] for args in args_list}
+            for i, future in enumerate(as_completed(futures)):
+                if progress_callback:
+                    progress_callback(i + 1, total)
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Visualization error: {e}")
 
     def _analyze_all_files(self, data, progress_callback=None):
         """Performs analysis on all loaded JSON files to detect cuff leaks."""
@@ -426,15 +454,18 @@ class CuffLDT(QMainWindow):
             'file_name': 'File Name',
             'cuff_id': 'Cuff ID',
             'ekg_id': 'EKG ID',
-            'cond1': 'Condition 1 (Mean < 11000 & > 6500)',
-            'cond2': 'Condition 2 (Max < 14000)',
-            'cond3': 'Condition 3 (Min > 2000)',
-            'cond4': 'Condition 4 (Std < 1000)',
+            'run_name': 'Run',
+            'cond1': 'Cond 1 (6500 < Mean < 11000)',
+            'cond1_st': 'Cond 1 (Mean < 11000)',
+            'cond1_lt': 'Cond 1 (Mean > 6500)',
+            'cond2': 'Cond 2 (Max < 14000)',
+            'cond3': 'Cond 3 (Min > 2000)',
+            'cond4': 'Cond 4 (Std < 1000)',
             'cond_final': 'Final Pass/Fail',
             'max_settled_value': 'Max Settled Value',
             'min_settled_value': 'Min Settled Value',
             'mean_settled_value': 'Mean Settled Value',
-            'std_settled_value': 'Std Settled Value'
+            'std_settled_value': 'Std Settled Value',
         }
         
         # Rename columns for display
@@ -572,7 +603,9 @@ class CuffLDT(QMainWindow):
         )
         self.progress_bar.setValue(100)
         self.progress_step_label.setText("Done.")
-        self.run_analysis_button.setEnabled(False)
+        self.select_folder_button.setEnabled(True)
+        self.generate_plots_checkbox.setEnabled(True)
+        self.run_analysis_button.setEnabled(True)
         self.open_results_button.setEnabled(True)
 
     def _parse_device_name(self, dev_name, cuff_prefix='CAA', ekg_prefix='PAA'):
@@ -608,6 +641,8 @@ class CuffLDT(QMainWindow):
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     window = CuffLDT()
     window.show()
